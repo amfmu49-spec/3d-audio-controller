@@ -1,0 +1,5 @@
+{
+  "name": "3D Audio Controller",
+  "description": "A simple 3D audio visual controller using Web Audio API's PannerNode.",
+  "requestFramePermissions": []
+}
