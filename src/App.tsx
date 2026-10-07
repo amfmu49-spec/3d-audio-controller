@@ -53,6 +53,7 @@ export default function App() {
   const eqNodesRef = useRef<BiquadFilterNode[]>([]);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const silentKeepAliveRef = useRef<HTMLAudioElement | null>(null);
   const sourceNodeRef = useRef<MediaElementAudioSourceNode | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const dataArrayRef = useRef<Uint8Array | null>(null);
@@ -61,6 +62,10 @@ export default function App() {
   const heightRef = useRef(0);
   const isDragging = useRef(false);
   const heightTimeRef = useRef(0);
+
+  // 再生ステータスの同期・不意の中断防止フラグ
+  const isPlayingRef = useRef(false);
+  const userRequestedPauseRef = useRef(false);
 
   // バックグラウンドTicker用のWeb Workerと時間計測
   const workerRef = useRef<Worker | null>(null);
@@ -82,6 +87,15 @@ export default function App() {
 
   // AudioContextの初期化
   const initAudioContext = async () => {
+    // iOS Safari 16.4+ の AudioSession API を 'playback' に設定（システムによる音声中断を抑制）
+    if ('audioSession' in navigator) {
+      try {
+        (navigator as any).audioSession.type = 'playback';
+      } catch {
+        // ignore
+      }
+    }
+
     if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') {
       if (audioCtxRef.current.state === 'suspended' || (audioCtxRef.current.state as any) === 'interrupted') {
         await audioCtxRef.current.resume();
@@ -310,6 +324,8 @@ export default function App() {
       };
     }
 
+    userRequestedPauseRef.current = true;
+    isPlayingRef.current = false;
     setIsPlaying(false);
     setCurrentTime(0);
   };
@@ -323,21 +339,41 @@ export default function App() {
       return;
     }
 
+    // iOS Safari 16.4+ の AudioSession API を 'playback' に設定
+    if ('audioSession' in navigator) {
+      try {
+        (navigator as any).audioSession.type = 'playback';
+      } catch {
+        // ignore
+      }
+    }
+
     const ctx = await initAudioContext();
     if (ctx && (ctx.state === 'suspended' || (ctx.state as any) === 'interrupted')) {
       await ctx.resume();
     }
 
     if (isPlaying) {
+      // ユーザーによる明示的な停止
+      userRequestedPauseRef.current = true;
+      isPlayingRef.current = false;
       audioRef.current.pause();
+      silentKeepAliveRef.current?.pause();
       setIsPlaying(false);
     } else {
+      // ユーザーによる明示的な再生開始
+      userRequestedPauseRef.current = false;
+      isPlayingRef.current = true;
       try {
         await audioRef.current.play();
+        // ネイティブオーディオパイプラインを常時アクティブに維持する無音トラックを同時に起動
+        silentKeepAliveRef.current?.play().catch(() => {});
         setIsPlaying(true);
       } catch (err) {
         console.error("Playback failed:", err);
         alert("再生を開始できませんでした。ブラウザの設定で音声を許可してください。");
+        isPlayingRef.current = false;
+        setIsPlaying(false);
       }
     }
   };
@@ -377,15 +413,13 @@ export default function App() {
   // 物理回転・昇降のステップ前進（秒単位dtで計算し、バックグラウンドでも一定速度を保証）
   const advanceSpatialPhysics = useCallback((dt: number) => {
     if (isAutoRotate && !isDragging.current) {
-      // 1秒あたり約1.5ラジアン回転 (従来の0.025 rad/frame @ 60fpsと同一)
       angleRef.current = (angleRef.current + 1.5 * dt) % (Math.PI * 2);
       setAngle(angleRef.current);
     }
-    if (isAutoHeight && isPlaying) {
-      // 1秒あたり約0.9rad (従来の0.015 rad/frame @ 60fpsと同一)
+    if (isAutoHeight && isPlayingRef.current) {
       heightTimeRef.current += 0.9 * dt;
     }
-  }, [isAutoRotate, isAutoHeight, isPlaying]);
+  }, [isAutoRotate, isAutoHeight]);
 
   // バックグラウンドTicker用 Web Worker の作成
   // （タブが非表示／画面ロック時でもブラウザに制限されず3D音響の回転・昇降を滑らかに維持）
@@ -509,6 +543,8 @@ export default function App() {
     if (!('mediaSession' in navigator)) return;
 
     const resumeAndPlay = async () => {
+      userRequestedPauseRef.current = false;
+      isPlayingRef.current = true;
       if (audioCtxRef.current) {
         if (audioCtxRef.current.state === 'suspended' || (audioCtxRef.current.state as any) === 'interrupted') {
           await audioCtxRef.current.resume();
@@ -517,6 +553,8 @@ export default function App() {
       if (audioRef.current) {
         audioRef.current.play().catch(console.error);
       }
+      silentKeepAliveRef.current?.play().catch(() => {});
+      setIsPlaying(true);
     };
 
     navigator.mediaSession.setActionHandler('play', () => {
@@ -524,7 +562,11 @@ export default function App() {
     });
 
     navigator.mediaSession.setActionHandler('pause', () => {
+      userRequestedPauseRef.current = true;
+      isPlayingRef.current = false;
       audioRef.current?.pause();
+      silentKeepAliveRef.current?.pause();
+      setIsPlaying(false);
     });
 
     navigator.mediaSession.setActionHandler('seekto', (details) => {
@@ -556,11 +598,15 @@ export default function App() {
     });
 
     navigator.mediaSession.setActionHandler('stop', () => {
+      userRequestedPauseRef.current = true;
+      isPlayingRef.current = false;
       if (audioRef.current) {
         audioRef.current.pause();
         audioRef.current.currentTime = 0;
         setCurrentTime(0);
       }
+      silentKeepAliveRef.current?.pause();
+      setIsPlaying(false);
     });
 
     return () => {
@@ -573,24 +619,58 @@ export default function App() {
     };
   }, [updateMediaPosition]);
 
-  // モバイル復帰・バックグラウンド移行時の AudioContext 自動復旧
+  // モバイル画面ロック／タブ非表示への移行時に不意に途切れるのを即座に復帰・継続
   useEffect(() => {
-    const handleVisibilityChange = () => {
-      if (!document.hidden && isPlaying && audioCtxRef.current) {
-        if (audioCtxRef.current.state === 'suspended' || (audioCtxRef.current.state as any) === 'interrupted') {
-          audioCtxRef.current.resume().catch(console.error);
+    const ensureSeamlessPlayback = () => {
+      if (isPlayingRef.current && !userRequestedPauseRef.current) {
+        if (audioCtxRef.current && (audioCtxRef.current.state === 'suspended' || (audioCtxRef.current.state as any) === 'interrupted')) {
+          audioCtxRef.current.resume().catch(() => {});
+        }
+        if (audioRef.current && audioRef.current.paused) {
+          audioRef.current.play().catch(() => {});
+        }
+        if (silentKeepAliveRef.current && silentKeepAliveRef.current.paused) {
+          silentKeepAliveRef.current.play().catch(() => {});
         }
       }
     };
 
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-    window.addEventListener('pageshow', handleVisibilityChange);
+    document.addEventListener('visibilitychange', ensureSeamlessPlayback);
+    window.addEventListener('pagehide', ensureSeamlessPlayback);
+    window.addEventListener('pageshow', ensureSeamlessPlayback);
 
     return () => {
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
-      window.removeEventListener('pageshow', handleVisibilityChange);
+      document.removeEventListener('visibilitychange', ensureSeamlessPlayback);
+      window.removeEventListener('pagehide', ensureSeamlessPlayback);
+      window.removeEventListener('pageshow', ensureSeamlessPlayback);
     };
-  }, [isPlaying]);
+  }, []);
+
+  // オーディオ要素が停止したときのハンドラ（ブラウザによる不意の停止をインターセプトしてシームレス維持）
+  const handleAudioPause = () => {
+    if (userRequestedPauseRef.current) {
+      // ユーザー自身の操作による一時停止
+      setIsPlaying(false);
+      isPlayingRef.current = false;
+    } else {
+      // OS/ブラウザのバックグラウンド移行による不意の pause を即座にリカバリー
+      if (isPlayingRef.current) {
+        if (audioCtxRef.current && (audioCtxRef.current.state === 'suspended' || (audioCtxRef.current.state as any) === 'interrupted')) {
+          audioCtxRef.current.resume().catch(() => {});
+        }
+        if (audioRef.current && audioRef.current.paused) {
+          audioRef.current.play().catch(() => {
+            // ブラウザから完全に阻止された場合のみ状態を同期
+            setIsPlaying(false);
+            isPlayingRef.current = false;
+          });
+        }
+        if (silentKeepAliveRef.current && silentKeepAliveRef.current.paused) {
+          silentKeepAliveRef.current.play().catch(() => {});
+        }
+      }
+    }
+  };
 
   // シーク操作
   const handleSeekChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -724,7 +804,7 @@ export default function App() {
           </div>
           <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-zinc-800/80 border border-white/5 text-[10px] text-zinc-400 font-medium">
             <Radio className={`w-3 h-3 ${isPlaying ? 'text-emerald-400 animate-pulse' : 'text-zinc-500'}`} />
-            <span>BG再生対応</span>
+            <span>完全シームレスBG再生</span>
           </div>
         </div>
 
@@ -741,7 +821,7 @@ export default function App() {
                 {isLoading ? "読み込み中..." : error ? "エラーが発生しました" : fileName ? fileName : "タップしてMP3を選択"}
               </span>
               {error && <p className="text-[10px] text-red-500 mt-1 text-center">{error}</p>}
-              {!error && !isLoading && <p className="text-[9px] text-zinc-500 mt-1 uppercase tracking-widest">Supports background play</p>}
+              {!error && !isLoading && <p className="text-[9px] text-zinc-500 mt-1 uppercase tracking-widest">Seamless Background Audio</p>}
             </div>
             <input
               type="file"
@@ -822,13 +902,17 @@ export default function App() {
 
         {/* 再生コントロール */}
         <div className="space-y-4">
+          {/* メインMP3再生用オーディオ要素（display:none を避け、画面外配置でWebKitの省電力一時停止を抑止） */}
           <audio
             ref={audioRef}
             loop={isLoop}
             playsInline
             preload="auto"
-            onPlay={() => setIsPlaying(true)}
-            onPause={() => setIsPlaying(false)}
+            onPlay={() => {
+              setIsPlaying(true);
+              isPlayingRef.current = true;
+            }}
+            onPause={handleAudioPause}
             onTimeUpdate={() => {
               if (audioRef.current && !isSeeking) {
                 setCurrentTime(audioRef.current.currentTime);
@@ -843,10 +927,39 @@ export default function App() {
             }}
             onEnded={() => {
               if (!isLoop) {
+                userRequestedPauseRef.current = true;
+                isPlayingRef.current = false;
                 setIsPlaying(false);
+                silentKeepAliveRef.current?.pause();
               }
             }}
-            className="hidden"
+            style={{
+              position: 'fixed',
+              top: -9999,
+              left: -9999,
+              width: '1px',
+              height: '1px',
+              opacity: 0.001,
+              pointerEvents: 'none'
+            }}
+          />
+
+          {/* ネイティブOSオーディオセッションを常時維持する無音キープアライブ要素 */}
+          <audio
+            ref={silentKeepAliveRef}
+            src="./silent.wav"
+            loop
+            playsInline
+            preload="auto"
+            style={{
+              position: 'fixed',
+              top: -9999,
+              left: -9999,
+              width: '1px',
+              height: '1px',
+              opacity: 0.001,
+              pointerEvents: 'none'
+            }}
           />
 
           <button
@@ -983,7 +1096,7 @@ export default function App() {
           <div className="flex items-center gap-2 uppercase tracking-[0.2em]">
             <Headphones className="w-3 h-3 text-emerald-500/80" /> Use Headphones / Earphones
           </div>
-          <p className="text-[8px] text-zinc-600">画面オフ・他アプリ操作中も3D回転バックグラウンド再生継続</p>
+          <p className="text-[8px] text-zinc-600">画面オフ・アプリ切り替え時も途切れることなく3D立体音響が継続</p>
         </div>
       </div>
     </div>
